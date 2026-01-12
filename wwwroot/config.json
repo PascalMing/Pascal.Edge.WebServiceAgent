@@ -1,0 +1,7 @@
+{
+  "resourceApi": "http://127.0.0.1:5000",
+  "requestTimeoutMs": 10000,
+  "retryIntervalMs": 1000,
+  "maxRetries": 3,
+  "enableTls": true
+}
