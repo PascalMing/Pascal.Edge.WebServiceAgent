@@ -1,130 +1,214 @@
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
+using System.Net.Http.Headers;
+using Pascal.Edge.WebServiceAgent.Models;
+using Pascal.Edge.WebServiceAgent.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configure server URLs from configuration (appsettings.json "Urls")
-var urlsConfig = builder.Configuration["Urls"]; 
-if (!string.IsNullOrWhiteSpace(urlsConfig))
-{
-    // Support semicolon separated list
-    var urls = urlsConfig.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-    builder.WebHost.UseUrls(urls);
-}
-
-// Add services
-builder.Services.AddOpenApi();
-
-// CORS - allow frontend origins (configured via appsettings: AllowedOrigins)
-builder.Services.AddCors(options =>
-{
-    var allowedOrigins = builder.Configuration.GetSection("AllowedOrigins").Get<string[]>();
-    options.AddPolicy("AllowFrontend", policy =>
-    {
-        if (allowedOrigins != null && allowedOrigins.Length > 0)
-        {
-            policy.WithOrigins(allowedOrigins)
-                  .AllowAnyMethod()
-                  .AllowAnyHeader()
-                  .AllowCredentials();
-        }
-        else
-        {
-            // No configured origins: allow any origin but do not allow credentials
-            policy.AllowAnyOrigin()
-                  .AllowAnyMethod()
-                  .AllowAnyHeader();
-        }
-    });
-});
-
-// Load YARP reverse proxy configuration from appsettings.json
-builder.Services.AddReverseProxy().LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
-
-// Controllers (if any)
-builder.Services.AddControllers();
+builder.Services.AddSingleton<SiteConfigurationLoader>();
 
 var app = builder.Build();
 
-// Serve SPA static files from wwwroot (Vue dist should be placed here)
-app.UseDefaultFiles();
-app.UseStaticFiles();
+var configLoader = app.Services.GetRequiredService<SiteConfigurationLoader>();
+var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
 
-//app.UseHttpsRedirection();
-
-// Enable CORS
-app.UseCors("AllowFrontend");
-
-// Handle preflight requests for API
-app.Use(async (context, next) =>
+app.Use(next =>
 {
-    if (context.Request.Path.StartsWithSegments("/api/v1") &&
-        context.Request.Method == HttpMethods.Options)
+    return async context =>
     {
-        var allowedOrigins = builder.Configuration.GetSection("AllowedOrigins").Get<string[]>();
-        var requestOrigin = context.Request.Headers["Origin"].ToString();
-        if (!string.IsNullOrEmpty(requestOrigin) && allowedOrigins != null && allowedOrigins.Contains(requestOrigin))
+        var host = context.Request.Host.Host;
+        var options = configLoader.CurrentValue;
+        var site = configLoader.GetSiteByHostname(host);
+        
+        if (site == null)
         {
-            context.Response.Headers["Access-Control-Allow-Origin"] = requestOrigin;
-            context.Response.Headers["Access-Control-Allow-Credentials"] = "true";
-        }
-        else if (allowedOrigins != null && allowedOrigins.Length > 0)
-        {
-            context.Response.Headers["Access-Control-Allow-Origin"] = allowedOrigins[0];
-            context.Response.Headers["Access-Control-Allow-Credentials"] = "true";
-        }
-        else
-        {
-            // fallback: allow any origin but do not allow credentials
-            context.Response.Headers["Access-Control-Allow-Origin"] = "*";
+            context.Response.StatusCode = 404;
+            await context.Response.WriteAsync($"Site not found for hostname: {host}");
+            return;
         }
 
-        context.Response.Headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS";
-        context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization";
-        context.Response.StatusCode = StatusCodes.Status204NoContent;
-        return;
-    }
-    await next();
+        if (!string.IsNullOrEmpty(site.ForwardUrl))
+        {
+            await ForwardRequest(context, site.ForwardUrl, httpClient);
+            return;
+        }
+
+        var basePath = AppContext.BaseDirectory;
+        var fullPath = Path.GetFullPath(Path.Combine(basePath, site.Path));
+
+        if (!Directory.Exists(fullPath))
+        {
+            context.Response.StatusCode = 404;
+            await context.Response.WriteAsync($"Site directory not found: {fullPath}");
+            return;
+        }
+
+        var defaultDoc = options.DefaultDocument ?? "index.html";
+        var requestPath = context.Request.Path.Value?.TrimStart('/') ?? "";
+        
+        if (string.IsNullOrEmpty(requestPath))
+        {
+            requestPath = defaultDoc;
+        }
+
+        var requestedFilePath = Path.Combine(fullPath, requestPath);
+
+        if (Directory.Exists(requestedFilePath))
+        {
+            requestedFilePath = Path.Combine(requestedFilePath, defaultDoc);
+        }
+
+        if (File.Exists(requestedFilePath))
+        {
+            context.Response.ContentType = GetContentType(requestedFilePath);
+            await context.Response.SendFileAsync(requestedFilePath);
+            return;
+        }
+
+        if (options.EnableSPAFallback && !Path.HasExtension(requestPath))
+        {
+            var spaIndexPath = Path.Combine(fullPath, defaultDoc);
+            if (File.Exists(spaIndexPath))
+            {
+                context.Response.ContentType = "text/html; charset=utf-8";
+                await context.Response.SendFileAsync(spaIndexPath);
+                return;
+            }
+        }
+
+        context.Response.StatusCode = 404;
+        await context.Response.WriteAsync("404 - File Not Found");
+    };
 });
 
-// Ensure CORS response headers are present on proxied responses
-app.Use(async (context, next) =>
+var options = configLoader.CurrentValue;
+
+if (options.Sites == null || options.Sites.Count == 0)
 {
-    // Run the downstream handlers (including YARP)
-    await next();
-
-    if (context.Request.Path.StartsWithSegments("/api/v1"))
-    {
-        // Mirror Origin header if allowed, fallback to first configured origin
-        var allowedOrigins = builder.Configuration.GetSection("AllowedOrigins").Get<string[]>();
-        var origin = context.Request.Headers["Origin"].ToString();
-        if (!string.IsNullOrEmpty(origin) && allowedOrigins != null && allowedOrigins.Contains(origin))
-        {
-            context.Response.Headers["Access-Control-Allow-Origin"] = origin;
-        }
-        else if (allowedOrigins != null && allowedOrigins.Length > 0)
-        {
-            context.Response.Headers["Access-Control-Allow-Origin"] = allowedOrigins[0];
-        }
-        context.Response.Headers["Access-Control-Allow-Credentials"] = "true";
-        context.Response.Headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS";
-        context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization";
-    }
-});
-
-// Map reverse proxy
-app.MapReverseProxy();
-
-if (app.Environment.IsDevelopment())
-{
-    app.MapOpenApi();
+    Console.WriteLine("警告: 未配置任何站点，请检查 appsettings.json");
+    app.Run();
+    return;
 }
 
-// Map controllers
-app.MapControllers();
+var urls = options.Sites.Select(s => $"http://0.0.0.0:{s.Port}").ToArray();
+builder.WebHost.UseUrls(urls);
 
-// Fallback to SPA
-app.MapFallbackToFile("index.html");
+Console.WriteLine($"启动站点托管服务，监听端口: {string.Join(", ", options.Sites.Select(s => s.Port))}");
+
+foreach (var site in options.Sites)
+{
+    var target = !string.IsNullOrEmpty(site.ForwardUrl) 
+        ? site.ForwardUrl 
+        : $"./www-dist/{site.Name}";
+    Console.WriteLine($"  - {site.Name}: {string.Join(", ", site.Hostnames)} -> {target}");
+}
 
 app.Run();
+
+static async Task ForwardRequest(HttpContext context, string forwardUrl, HttpClient httpClient)
+{
+    try
+    {
+        var targetUri = new Uri(forwardUrl);
+        var requestPath = context.Request.Path.Value ?? "/";
+        var queryString = context.Request.QueryString.Value ?? "";
+        
+        var basePath = targetUri.AbsolutePath.TrimEnd('/');
+        var reqPath = requestPath.TrimStart('/');
+        var targetPath = $"/{reqPath}{queryString}";
+        
+        var targetUrl = $"{targetUri.Scheme}://{targetUri.Host}:{targetUri.Port}{basePath}{targetPath}";
+
+        using var request = new HttpRequestMessage(new HttpMethod(context.Request.Method), targetUrl);
+        
+        foreach (var header in context.Request.Headers)
+        {
+            if (!IsExcludedHeader(header.Key))
+            {
+                try 
+                { 
+                    request.Headers.TryAddWithoutValidation(header.Key, header.Value.ToString()); 
+                } 
+                catch { }
+            }
+        }
+
+        if (context.Request.ContentLength > 0)
+        {
+            request.Content = new StreamContent(context.Request.Body);
+            if (!string.IsNullOrEmpty(context.Request.ContentType))
+            {
+                request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(context.Request.ContentType);
+            }
+        }
+
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        
+        context.Response.StatusCode = (int)response.StatusCode;
+        
+        foreach (var header in response.Headers.Concat(response.Content.Headers))
+        {
+            if (!IsExcludedResponseHeader(header.Key))
+            {
+                try { context.Response.Headers[header.Key] = header.Value.ToArray(); } catch { }
+            }
+        }
+
+        await response.Content.CopyToAsync(context.Response.Body);
+    }
+    catch (TaskCanceledException)
+    {
+        context.Response.StatusCode = 504;
+        await context.Response.WriteAsync("Gateway Timeout");
+    }
+    catch (HttpRequestException ex)
+    {
+        context.Response.StatusCode = 502;
+        await context.Response.WriteAsync($"Forward error: {ex.Message}");
+    }
+    catch (Exception ex)
+    {
+        context.Response.StatusCode = 502;
+        await context.Response.WriteAsync($"Forward error: {ex.Message}");
+    }
+}
+
+static bool IsExcludedHeader(string headerName)
+{
+    var excluded = new[] { "Host", "Content-Length", "Connection", "Transfer-Encoding", "Keep-Alive" };
+    return excluded.Any(e => e.Equals(headerName, StringComparison.OrdinalIgnoreCase));
+}
+
+static bool IsExcludedResponseHeader(string headerName)
+{
+    var excluded = new[] { "Transfer-Encoding", "Connection", "Keep-Alive", "Content-Length" };
+    return excluded.Any(e => e.Equals(headerName, StringComparison.OrdinalIgnoreCase));
+}
+
+static string GetContentType(string filePath)
+{
+    var extension = Path.GetExtension(filePath).ToLowerInvariant();
+    return extension switch
+    {
+        ".html" => "text/html; charset=utf-8",
+        ".htm" => "text/html; charset=utf-8",
+        ".css" => "text/css; charset=utf-8",
+        ".js" => "application/javascript; charset=utf-8",
+        ".json" => "application/json",
+        ".png" => "image/png",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".gif" => "image/gif",
+        ".svg" => "image/svg+xml",
+        ".ico" => "image/x-icon",
+        ".woff" => "font/woff",
+        ".woff2" => "font/woff2",
+        ".ttf" => "font/ttf",
+        ".eot" => "application/vnd.ms-fontobject",
+        ".otf" => "font/otf",
+        ".webp" => "image/webp",
+        ".webm" => "video/webm",
+        ".mp4" => "video/mp4",
+        ".pdf" => "application/pdf",
+        ".zip" => "application/zip",
+        _ => "application/octet-stream"
+    };
+}
