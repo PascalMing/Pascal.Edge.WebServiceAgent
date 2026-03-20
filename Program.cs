@@ -16,14 +16,20 @@ app.Use(next =>
     return async context =>
     {
         var host = context.Request.Host.Host;
+        var port = context.Request.Host.Port ?? 80;
         var options = configLoader.CurrentValue;
+        
         var site = configLoader.GetSiteByHostname(host);
         
         if (site == null)
         {
-            context.Response.StatusCode = 404;
-            await context.Response.WriteAsync($"Site not found for hostname: {host}");
-            return;
+            site = configLoader.GetSiteByPort(port);
+            if (site == null)
+            {
+                context.Response.StatusCode = 404;
+                await context.Response.WriteAsync($"Site not found for hostname: {host}");
+                return;
+            }
         }
 
         if (!string.IsNullOrEmpty(site.ForwardUrl))

@@ -148,6 +148,19 @@ public class SiteConfigurationLoader : IOptionsMonitor<SiteOptions>, IDisposable
             }
         }
         
+        return null;
+    }
+    
+    public Site? GetSiteByPort(int port)
+    {
+        var options = _currentOptions;
+        
+        var site = options.Sites.FirstOrDefault(s => s.Port == port);
+        if (site != null)
+        {
+            return site;
+        }
+        
         if (!string.IsNullOrEmpty(options.DefaultSite))
         {
             return options.Sites.FirstOrDefault(s => 
